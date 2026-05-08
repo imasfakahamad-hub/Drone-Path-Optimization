@@ -1,0 +1,297 @@
+# Drone Path Optimization using Improved Deep Q Network
+
+import numpy as np
+import random
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from collections import deque
+import matplotlib.pyplot as plt
+
+
+# ==============================
+# Device configuration
+# ==============================
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print("Using Device:", device)
+
+
+# ==============================
+# Environment
+# ==============================
+
+class DroneEnv:
+
+    def __init__(self, grid_size=10):
+
+        self.grid_size = grid_size
+        self.goal = [grid_size-1, grid_size-1]
+
+        self.obstacles = [
+            [3,3],[3,4],[4,3],
+            [6,6],[7,6],[6,7]
+        ]
+
+        self.reset()
+
+    def reset(self):
+
+        self.drone = [0,0]
+        self.steps = 0
+
+        return self.get_state()
+
+    def get_state(self):
+
+        return np.array(self.drone + self.goal, dtype=np.float32)
+
+    def step(self, action):
+
+        if action == 0:
+            self.drone[1] += 1
+        elif action == 1:
+            self.drone[1] -= 1
+        elif action == 2:
+            self.drone[0] += 1
+        elif action == 3:
+            self.drone[0] -= 1
+
+        self.drone[0] = np.clip(self.drone[0],0,self.grid_size-1)
+        self.drone[1] = np.clip(self.drone[1],0,self.grid_size-1)
+
+        self.steps += 1
+
+        reward = -0.5
+        done = False
+
+        if self.drone in self.obstacles:
+            reward = -100
+            done = True
+
+        if self.drone == self.goal:
+            reward = 100
+            done = True
+
+        if self.steps > 200:
+            done = True
+
+        return self.get_state(), reward, done
+
+
+# ==============================
+# Neural Network
+# ==============================
+
+class DQN(nn.Module):
+
+    def __init__(self):
+
+        super(DQN,self).__init__()
+
+        self.network = nn.Sequential(
+
+            nn.Linear(4,128),
+            nn.ReLU(),
+
+            nn.Linear(128,128),
+            nn.ReLU(),
+
+            nn.Linear(128,4)
+
+        )
+
+    def forward(self,x):
+        return self.network(x)
+
+
+# ==============================
+# Replay Buffer
+# ==============================
+
+class ReplayBuffer:
+
+    def __init__(self,capacity):
+
+        self.buffer = deque(maxlen=capacity)
+
+    def push(self,state,action,reward,next_state,done):
+
+        self.buffer.append((state,action,reward,next_state,done))
+
+    def sample(self,batch_size):
+
+        batch = random.sample(self.buffer,batch_size)
+
+        state,action,reward,next_state,done = map(np.array,zip(*batch))
+
+        return state,action,reward,next_state,done
+
+    def __len__(self):
+
+        return len(self.buffer)
+
+
+# ==============================
+# Initialize
+# ==============================
+
+env = DroneEnv()
+
+policy_net = DQN().to(device)
+target_net = DQN().to(device)
+
+target_net.load_state_dict(policy_net.state_dict())
+
+optimizer = optim.Adam(policy_net.parameters(),lr=0.001)
+
+memory = ReplayBuffer(10000)
+
+
+# ==============================
+# Hyperparameters
+# ==============================
+
+gamma = 0.99
+
+epsilon = 1.0
+epsilon_min = 0.05
+epsilon_decay = 0.995
+
+episodes = 600
+batch_size = 64
+
+target_update = 10
+
+reward_history = []
+
+
+# ==============================
+# Training
+# ==============================
+
+for episode in range(episodes):
+
+    state = env.reset()
+    state = torch.tensor(state).float().to(device)
+
+    total_reward = 0
+
+    while True:
+
+        if random.random() < epsilon:
+            action = random.randint(0,3)
+        else:
+            with torch.no_grad():
+                q_values = policy_net(state)
+                action = torch.argmax(q_values).item()
+
+        next_state,reward,done = env.step(action)
+
+        memory.push(state.cpu().numpy(),action,reward,next_state,done)
+
+        next_state = torch.tensor(next_state).float().to(device)
+
+        state = next_state
+
+        total_reward += reward
+
+
+        # Learning
+        if len(memory) > batch_size:
+
+            states,actions,rewards,next_states,dones = memory.sample(batch_size)
+
+            states = torch.tensor(states).float().to(device)
+            actions = torch.tensor(actions).to(device)
+            rewards = torch.tensor(rewards).float().to(device)
+            next_states = torch.tensor(next_states).float().to(device)
+            dones = torch.tensor(dones).float().to(device)
+
+            q_values = policy_net(states)
+            next_q_values = target_net(next_states)
+
+            q_value = q_values.gather(1,actions.unsqueeze(1)).squeeze(1)
+
+            next_q = torch.max(next_q_values,1)[0]
+
+            expected_q = rewards + gamma*next_q*(1-dones)
+
+            loss = nn.MSELoss()(q_value,expected_q.detach())
+
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+
+
+        if done:
+            break
+
+
+    reward_history.append(total_reward)
+
+    epsilon = max(epsilon_min,epsilon*epsilon_decay)
+
+    if episode % target_update == 0:
+        target_net.load_state_dict(policy_net.state_dict())
+
+    print(f"Episode {episode} Reward {total_reward} Epsilon {epsilon:.3f}")
+
+
+# ==============================
+# Plot Training Curve
+# ==============================
+
+plt.plot(reward_history)
+plt.title("Training Reward Curve")
+plt.xlabel("Episode")
+plt.ylabel("Reward")
+plt.show()
+
+
+# ==============================
+# Test Trained Drone
+# ==============================
+
+state = env.reset()
+state = torch.tensor(state).float().to(device)
+
+path = [env.drone.copy()]
+
+while True:
+
+    with torch.no_grad():
+        action = torch.argmax(policy_net(state)).item()
+
+    next_state,reward,done = env.step(action)
+
+    state = torch.tensor(next_state).float().to(device)
+
+    path.append(env.drone.copy())
+
+    if done:
+        break
+
+
+print("Optimal Path:",path)
+
+
+# ==============================
+# Visualization
+# ==============================
+
+grid = np.zeros((10,10))
+
+for obs in env.obstacles:
+    grid[obs[1]][obs[0]] = -1
+
+for p in path:
+    grid[p[1]][p[0]] = 0.6
+
+gx,gy = env.goal
+grid[gy][gx] = 1
+
+plt.imshow(grid)
+plt.title("Optimized Drone Path")
+plt.colorbar()
+plt.show()
